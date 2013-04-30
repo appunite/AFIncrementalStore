@@ -255,19 +255,19 @@ withAttributeAndRelationshipValuesFromManagedObject:(NSManagedObject *)managedOb
                                     fromResponse:(NSHTTPURLResponse *)response
                                      withContext:(NSManagedObjectContext *)context
                                            error:(NSError *__autoreleasing *)error
-                                 completionBlock:(void (^)(NSArray *managedObjects, NSArray *backingObjects))completionBlock
+                                 completionBlock:(void (^)(BOOL touched, NSArray *managedObjects, NSArray *backingObjects))completionBlock
 {
     NSParameterAssert([representationOrArrayOfRepresentations isKindOfClass:[NSArray class]] || [representationOrArrayOfRepresentations isKindOfClass:[NSDictionary class]]);
     
+    NSManagedObjectContext *backingContext = [self backingManagedObjectContext];
     if ([representationOrArrayOfRepresentations count] == 0) {
         if (completionBlock) {
-            completionBlock([NSArray array], [NSArray array]);
+            completionBlock(NO ,[NSArray array], [NSArray array]);
         }
         
         return NO;
     }
     
-    NSManagedObjectContext *backingContext = [self backingManagedObjectContext];
     NSString *lastModified = [[response allHeaderFields] valueForKey:@"Last-Modified"];
 
     NSArray *representations = nil;
@@ -324,7 +324,7 @@ withAttributeAndRelationshipValuesFromManagedObject:(NSManagedObject *)managedOb
                 continue;
             }
             
-            [self insertOrUpdateObjectsFromRepresentations:relationshipRepresentation ofEntity:relationship.destinationEntity fromResponse:response withContext:context error:error completionBlock:^(NSArray *managedObjects, NSArray *backingObjects) {
+            [self insertOrUpdateObjectsFromRepresentations:relationshipRepresentation ofEntity:relationship.destinationEntity fromResponse:response withContext:context error:error completionBlock:^(BOOL touched, NSArray *managedObjects, NSArray *backingObjects) {
                 if ([relationship isToMany]) {
                     if ([relationship isOrdered]) {
                         [managedObject setValue:[NSOrderedSet orderedSetWithArray:managedObjects] forKey:relationship.name];
@@ -345,7 +345,7 @@ withAttributeAndRelationshipValuesFromManagedObject:(NSManagedObject *)managedOb
     }
     
     if (completionBlock) {
-        completionBlock(mutableManagedObjects, mutableBackingObjects);
+        completionBlock(YES, mutableManagedObjects, mutableBackingObjects);
     }
 
     return YES;
@@ -365,11 +365,17 @@ withAttributeAndRelationshipValuesFromManagedObject:(NSManagedObject *)managedOb
             childContext.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy;
                         
             [childContext performBlockAndWait:^{
-                [self insertOrUpdateObjectsFromRepresentations:representationOrArrayOfRepresentations ofEntity:fetchRequest.entity fromResponse:operation.response withContext:childContext error:error completionBlock:^(NSArray *managedObjects, NSArray *backingObjects) {
+                [self insertOrUpdateObjectsFromRepresentations:representationOrArrayOfRepresentations ofEntity:fetchRequest.entity fromResponse:operation.response withContext:childContext error:error completionBlock:^(BOOL touched, NSArray *managedObjects, NSArray *backingObjects) {
                 
                     NSSet *childObjects = [childContext registeredObjects];
                     
-                    if (![[self backingManagedObjectContext] save:error] || ![childContext save:error]) {
+                    NSManagedObjectContext *backingManagedObjectContext = [self backingManagedObjectContext];
+                    
+                    if (touched && ![backingManagedObjectContext save:error]) {
+                        @throw [NSException exceptionWithName:NSInternalInconsistencyException reason:[*error localizedFailureReason] userInfo:[NSDictionary dictionaryWithObject:*error forKey:NSUnderlyingErrorKey]];
+                    }
+                    
+                    if (touched && ![childContext save:error]) {
                         @throw [NSException exceptionWithName:NSInternalInconsistencyException reason:[*error localizedFailureReason] userInfo:[NSDictionary dictionaryWithObject:*error forKey:NSUnderlyingErrorKey]];
                     }
                     
@@ -773,7 +779,7 @@ withAttributeAndRelationshipValuesFromManagedObject:(NSManagedObject *)managedOb
                 id representationOrArrayOfRepresentations = [self.HTTPClient representationOrArrayOfRepresentationsOfEntity:relationship.entity fromResponseObject:responseObject];
                 
                 [childContext performBlockAndWait:^{
-                    [self insertOrUpdateObjectsFromRepresentations:representationOrArrayOfRepresentations ofEntity:relationship.destinationEntity fromResponse:operation.response withContext:strongChildContext error:error completionBlock:^(NSArray *managedObjects, NSArray *backingObjects) {
+                    [self insertOrUpdateObjectsFromRepresentations:representationOrArrayOfRepresentations ofEntity:relationship.destinationEntity fromResponse:operation.response withContext:strongChildContext error:error completionBlock:^(BOOL touched, NSArray *managedObjects, NSArray *backingObjects) {
                         NSManagedObject *managedObject = [strongChildContext objectWithID:objectID];
                         NSManagedObject *backingObject = [[self backingManagedObjectContext] existingObjectWithID:objectID error:nil];
                         

@@ -145,6 +145,8 @@ static NSString * AFQueryByAppendingParameters(NSString *query, NSDictionary *pa
         _candidateKeys = [[NSArray alloc] initWithObjects:@"id", @"_id", @"identifier", @"url", @"URL", nil];
     });
     
+    
+    
     NSString *key = [[representation allKeys] firstObjectCommonWithArray:_candidateKeys];
     if (key) {
         id value = [representation valueForKey:key];
