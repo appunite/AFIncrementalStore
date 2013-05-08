@@ -35,6 +35,8 @@ NSString * const AFIncrementalStorePersistentStoreRequestKey = @"AFIncrementalSt
 NSString * const AFIncrementalStoreFetchedObjectsKey = @"AFIncrementalStoreFetchedObjectsKey";
 
 static char kAFResourceIdentifierObjectKey;
+static char kAFPostponedInsertObjectsKey;
+static char kAFPostponedUpdateObjectsKey;
 
 static NSString * const kAFIncrementalStoreResourceIdentifierAttributeName = @"__af_resourceIdentifier";
 static NSString * const kAFIncrementalStoreLastModifiedAttributeName = @"__af_lastModified";
@@ -60,10 +62,14 @@ inline NSString * AFResourceIdentifierFromReferenceObject(id referenceObject) {
 
 @interface NSManagedObject (_AFIncrementalStore)
 @property (readwrite, nonatomic, copy, setter = af_setResourceIdentifier:) NSString *af_resourceIdentifier;
+@property (readonly, nonatomic, strong) NSMutableSet *postponedDependantInsertObjects;
+@property (readonly, nonatomic, strong) NSMutableSet *postponedDependantUpdatedObjects;
 @end
 
 @implementation NSManagedObject (_AFIncrementalStore)
 @dynamic af_resourceIdentifier;
+@dynamic postponedDependantInsertObjects;
+@dynamic postponedDependantUpdatedObjects;
 
 - (NSString *)af_resourceIdentifier {
     NSString *identifier = (NSString *)objc_getAssociatedObject(self, &kAFResourceIdentifierObjectKey);
@@ -84,6 +90,31 @@ inline NSString * AFResourceIdentifierFromReferenceObject(id referenceObject) {
     objc_setAssociatedObject(self, &kAFResourceIdentifierObjectKey, resourceIdentifier, OBJC_ASSOCIATION_COPY_NONATOMIC);
 }
 
+
+- (NSMutableSet *)postponedDependantInsertObjects {
+    NSMutableSet *array = (NSMutableSet *)objc_getAssociatedObject(self, &kAFPostponedInsertObjectsKey);
+    
+    if (!array) {
+        array = [[NSMutableSet alloc] init];
+        
+        objc_setAssociatedObject(self, &kAFPostponedInsertObjectsKey, array, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    
+    return array;
+}
+
+- (NSMutableSet *)postponedDependantUpdatedObjects {
+    NSMutableSet *array = (NSMutableSet *)objc_getAssociatedObject(self, &kAFPostponedUpdateObjectsKey);
+    
+    if (!array) {
+        array = [[NSMutableSet alloc] init];
+        
+        objc_setAssociatedObject(self, &kAFPostponedUpdateObjectsKey, array, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    
+    return array;
+}
+
 @end
 
 #pragma mark -
@@ -94,9 +125,11 @@ inline NSString * AFResourceIdentifierFromReferenceObject(id referenceObject) {
     NSMutableDictionary *_registeredObjectIDsByEntityNameAndNestedResourceIdentifier;
     NSPersistentStoreCoordinator *_backingPersistentStoreCoordinator;
     NSManagedObjectContext *_backingManagedObjectContext;
+    NSMutableArray *_processingObjects;
 }
 @synthesize HTTPClient = _HTTPClient;
 @synthesize backingPersistentStoreCoordinator = _backingPersistentStoreCoordinator;
+@synthesize processingObjects = _processingObjects;
 
 + (NSString *)type {
     @throw([NSException exceptionWithName:AFIncrementalStoreUnimplementedMethodException reason:NSLocalizedString(@"Unimplemented method: +type. Must be overridden in a subclass", nil) userInfo:nil]);
@@ -104,6 +137,14 @@ inline NSString * AFResourceIdentifierFromReferenceObject(id referenceObject) {
 
 + (NSManagedObjectModel *)model {
     @throw([NSException exceptionWithName:AFIncrementalStoreUnimplementedMethodException reason:NSLocalizedString(@"Unimplemented method: +model. Must be overridden in a subclass", nil) userInfo:nil]);
+}
+
+- (id)initWithPersistentStoreCoordinator:(NSPersistentStoreCoordinator *)root configurationName:(NSString *)name URL:(NSURL *)url options:(NSDictionary *)options {
+    self = [super initWithPersistentStoreCoordinator:root configurationName:name URL:url options:options];
+    if (self) {
+        _processingObjects = [[NSMutableArray alloc] init];
+    }
+    return self;
 }
 
 #pragma mark -
@@ -461,8 +502,21 @@ withAttributeAndRelationshipValuesFromManagedObject:(NSManagedObject *)managedOb
     NSMutableArray *mutableOperations = [NSMutableArray array];
     NSManagedObjectContext *backingContext = [self backingManagedObjectContext];
 
+    for (NSManagedObject *object in [saveChangesRequest insertedObjects]) {
+        if (![self.processingObjects containsObject:object]) {
+            [self addProcessingObject: object];
+        }
+    }
+
+    for (NSManagedObject *object in [saveChangesRequest updatedObjects]) {
+        if (![self.processingObjects containsObject:object]) {
+            [self addProcessingObject: object];
+        }
+    }
+    
     if ([self.HTTPClient respondsToSelector:@selector(requestForInsertedObject:)]) {
         for (NSManagedObject *insertedObject in [saveChangesRequest insertedObjects]) {
+            
             NSURLRequest *request = [self.HTTPClient requestForInsertedObject:insertedObject];
             if (!request) {
                 [backingContext performBlockAndWait:^{
@@ -480,8 +534,20 @@ withAttributeAndRelationshipValuesFromManagedObject:(NSManagedObject *)managedOb
                 [insertedObject willChangeValueForKey:@"objectID"];
                 [context obtainPermanentIDsForObjects:[NSArray arrayWithObject:insertedObject] error:nil];
                 [insertedObject didChangeValueForKey:@"objectID"];
+                
+                [self removeProcessingObject:insertedObject success:YES];
                 continue;
             }
+            
+            // check if other object has dependency
+            NSManagedObject *dependentObject = [self hasDependenciesBeingProcessed:insertedObject];
+            if (dependentObject != nil) {
+                NSLog(@"Dependant object %@ adding new postopned object: %@", dependentObject.entity.name, insertedObject.entity.name);
+                [dependentObject.postponedDependantInsertObjects addObject:insertedObject];
+                
+                continue;
+            }
+            
             
             AFHTTPRequestOperation *operation = [self.HTTPClient HTTPRequestOperationWithRequest:request success:^(AFHTTPRequestOperation *operation, id responseObject) {
                 id representationOrArrayOfRepresentations = [self.HTTPClient representationOrArrayOfRepresentationsOfEntity:[insertedObject entity]  fromResponseObject:responseObject];
@@ -516,8 +582,10 @@ withAttributeAndRelationshipValuesFromManagedObject:(NSManagedObject *)managedOb
                     [insertedObject didChangeValueForKey:@"objectID"];
 
                     [context refreshObject:insertedObject mergeChanges:NO];
+                    [self removeProcessingObject:insertedObject success:YES];
                 }
             } failure:^(AFHTTPRequestOperation *operation, NSError *error) {
+                [self removeProcessingObject:insertedObject success:NO];
                 NSLog(@"Insert Error: %@", error);
             }];
             
@@ -536,6 +604,15 @@ withAttributeAndRelationshipValuesFromManagedObject:(NSManagedObject *)managedOb
                     [self updateBackingObject:backingObject withAttributeAndRelationshipValuesFromManagedObject:updatedObject];
                     [backingContext save:nil];
                 }];
+                [self removeProcessingObject:updatedObject success:YES];
+                continue;
+            }
+            
+            // check if other object has dependency
+            NSManagedObject *dependentObject = [self hasDependenciesBeingProcessed:updatedObject];
+            if (dependentObject != nil) {
+                [dependentObject.postponedDependantInsertObjects addObject:updatedObject];
+                
                 continue;
             }
             
@@ -552,8 +629,10 @@ withAttributeAndRelationshipValuesFromManagedObject:(NSManagedObject *)managedOb
                     }];
 
                     [context refreshObject:updatedObject mergeChanges:NO];
+                    [self removeProcessingObject:updatedObject success:YES];
                 }
             } failure:^(AFHTTPRequestOperation *operation, NSError *error) {
+                [self removeProcessingObject:updatedObject success:NO];
                 NSLog(@"Update Error: %@", error);
                 [context refreshObject:updatedObject mergeChanges:NO];
             }];
@@ -864,6 +943,48 @@ withAttributeAndRelationshipValuesFromManagedObject:(NSManagedObject *)managedOb
     
     for (NSManagedObjectID *objectID in objectIDs) {
         [[_registeredObjectIDsByEntityNameAndNestedResourceIdentifier objectForKey:objectID.entity.name] removeObjectForKey:AFResourceIdentifierFromReferenceObject([self referenceObjectForObjectID:objectID])];
+    }
+}
+
+#pragma mark - Object dependencies handling
+
+- (NSManagedObject *) hasDependenciesBeingProcessed:(NSManagedObject *)object {
+    
+    for (NSRelationshipDescription *relationship in [object.entity.relationshipsByName allValues]) {
+        
+        // handle simple situation where object has relationship to one and inverse is to many
+        if (![relationship isToMany] && [relationship.inverseRelationship isToMany]) {
+            for (NSManagedObject *obj in self.processingObjects) {
+                if ([[obj.entity name] isEqualToString:[relationship.inverseRelationship.entity name]]) {
+                    return obj;
+                }
+            }
+        }
+        
+    }
+    return nil;
+}
+
+- (void) addProcessingObject:(NSManagedObject *)object {
+    [self.processingObjects addObject:object];
+}
+
+- (void) removeProcessingObject:(NSManagedObject *)object success:(BOOL)success {
+    [self.processingObjects removeObject:object];
+    
+    if (success) {
+        NSSaveChangesRequest *saveChangesRequest = [[NSSaveChangesRequest alloc] initWithInsertedObjects:object.postponedDependantInsertObjects updatedObjects:object.postponedDependantUpdatedObjects deletedObjects:nil lockedObjects:nil];
+        
+        NSLog(@"Executing queue for object %@, inserted: %d", object.entity.name, object.postponedDependantInsertObjects.count);
+        
+        NSError *error = nil;
+        [self executeSaveChangesRequest:saveChangesRequest withContext:object.managedObjectContext error:&error];
+        if (error) {
+            NSLog(@"error: %@", [error localizedDescription]);
+            // error saving dependant objects
+        }
+    } else {
+        // cant insert/update that are depenedant
     }
 }
 

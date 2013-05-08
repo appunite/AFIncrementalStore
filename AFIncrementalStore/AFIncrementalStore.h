@@ -66,6 +66,11 @@
  */
 @property (readonly) NSPersistentStoreCoordinator *backingPersistentStoreCoordinator;
 
+/**
+ Array of currently processed objects to web service
+ */
+@property (readonly, strong) NSMutableArray *processingObjects;
+
 ///-----------------------
 /// @name Required Methods
 ///-----------------------
